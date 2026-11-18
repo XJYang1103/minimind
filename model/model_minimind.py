@@ -48,19 +48,42 @@ class MiniMindConfig(PretrainedConfig):
 #                                     MiniMind Model
 # 🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏🌎🌍🌏
 class RMSNorm(torch.nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-5):
+    def __init__(self, dim: int, eps: float = 1e-5): #dim：特征维度，MiniMind 中是 768
         super().__init__()
-        self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps  # epsilon防止除0异常
+        self.weight = nn.Parameter(torch.ones(dim)) # γ(768,)，初始化全1
 
-    def norm(self, x):
+    def norm(self, x): #计算 没乘γ前的
+        # mean(-1, )是沿着最后一维求平均，保留前面的batch，token等维度
+        # keepdim=True 是保留求平均的这个维度，把他的大小变成1：
+        """
+        输入 x                     (2, 3, 768)
+        mean(-1, keepdim=True)     (2, 3, 1)  这样让最后一维是1，方便和x进行广播
+        mean(-1, keepdim=False)    (2, 3)
+        """
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
+    def forward(self, x): # 乘γ。
+        """
+        .type_as(x): 把结果转变成x的输入类型，传回x
+
+        原始 x       float16，形状 (2, 3, 768)
+        x.float()      float32，形状 (2, 3, 768)
+        归一化计算      float32，形状 (2, 3, 768)
+        .type_as(x)  float16，形状 (2, 3, 768)
+
+        归一化先用 FP32 计算，再将结果转回原输入 x 的类型
+        """
         return (self.weight * self.norm(x.float())).type_as(x)
 
+
+# RoPE 实现的核心函数，预计算所有位置的旋转角度cos、sin 表（跟minimind-learn的不一样）
+# 这里是 前后半维配对，而learn是 相邻维度配对
 def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float = 1e6, rope_scaling: dict = None):
+    #频率 θ ,此时是针对所有维度对i的，形状是（dim/2,）
     freqs, attn_factor = 1.0 / (rope_base ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim)), 1.0
+
+    # YaRN
     if rope_scaling is not None: # YaRN: f'(i) = f(i)((1-γ) + γ/s), where γ∈[0,1] is linear ramp
         orig_max, factor, beta_fast, beta_slow, attn_factor = (
             rope_scaling.get("original_max_position_embeddings", 2048), rope_scaling.get("factor", 16),
@@ -71,17 +94,113 @@ def precompute_freqs_cis(dim: int, end: int = int(32 * 1024), rope_base: float =
             low, high = max(math.floor(inv_dim(beta_fast)), 0), min(math.ceil(inv_dim(beta_slow)), dim // 2 - 1)
             ramp = torch.clamp((torch.arange(dim // 2, device=freqs.device).float() - low) / max(high - low, 0.001), 0, 1)
             freqs = freqs * (1 - ramp + ramp / factor)
+
+    # t就是p的序列，把p和θ 逐个相乘得到最终的角度
     t = torch.arange(end, device=freqs.device)
+    # p·θ得到角度α
     freqs = torch.outer(t, freqs).float()
+    # cat用来沿着dim=-1拼接向量，attn_factor 是YaRN缩放系数。
+    # 算两遍一样的cos，拼接到一起
+    """
+    freqs=每个维度对i处的 角度，记录所有token（p），所有维度对（i），的角度p·θ_i
+
+    假设有3个token，两个维度对：
+    freqs =
+    [
+        [0, 0],      p=0
+        [1, 0.001],  p=1
+        [2, 0.002]   p=2
+    ]
+
+    cat([torch.cos(freqs), torch.cos(freqs)], dim=-1):
+    某个位置的角度       [α, β]
+    求 sin              [sinα, sinβ]
+    拼接两份            [sinα, sinβ, sinα, sinβ]
+
+
+    为什么要拼接两份？
+    因为这份实现将前后两半配对。（learn里面是***相邻配对***，就是第一个和第二个配对）
+    特征       [a,    b,    c,    d]
+    配对        (a,c) 使用角度 α
+                (b,d) 使用角度 β
+
+    cos 系数   [cosα, cosβ, cosα, cosβ]
+    sin 系数   [sinα, sinβ, sinα, sinβ]
+    这样 a、c 得到相同的角度系数，b、d 也得到相同的角度系数，就能配合 rotate_half 完成二维旋转。
+    
+    """
+    # 得到角度的sin，cos值
     freqs_cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1) * attn_factor
     freqs_sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1) * attn_factor
     return freqs_cos, freqs_sin
 
 def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
-    def rotate_half(x): return torch.cat((-x[..., x.shape[-1] // 2:], x[..., : x.shape[-1] // 2]), dim=-1)
+# 假设q用一个batch二条,每条2个 token、每个token 2个头、每头8维。q.shape=(2, 2, 2, 8)
+    def rotate_half(x):  # 假设只用最后一维举例 x = [1, 2, 3, 4, 5, 6, 7, 8]
+        return torch.cat(
+            (   # ...是保留保留前面的所有维度，只对最后一维切割  
+                -x[..., x.shape[-1] // 2:], #8//2=4，从下标为4处开始直到最后：[−5, −6, −7, −8]
+                x[..., : x.shape[-1] // 2]  #左闭右开，取不到下标4：[1, 2, 3, 4]
+            ), 
+            dim=-1) # [−5, −6, −7, −8, 1, 2, 3, 4]
+    # 对k，q执行旋转
+    """
+    假设 q = [1, 2, 3, 4, 5, 6, 7, 8]
+    前后半维配成 4 对。
+    第0对：(1, 5)
+    第1对：(2, 6)
+    第2对：(3, 7)
+    第3对：(4, 8)  对每一对(1x2)的向量进行旋转
+
+    上一个函数已经得到了sin，cos对应角度的值:假设四个角度是90°、0°、90°、0°。
+    cos = [0, 1, 0, 1, 0, 1, 0, 1]
+    sin = [1, 0, 1, 0, 1, 0, 1, 0]  
+
+1.
+    x     [1, 2, 3, 4, 5, 6, 7, 8]
+    cos   [0, 1, 0, 1, 0, 1, 0, 1]
+    结果  [*0, 2, 0, 4, *0, 6, 0, 8]
+2.
+    rotate_half(x)  [−5, −6, −7, −8, 1, 2, 3, 4]
+    sin            [ 1,  0,  1,  0, 1, 0, 1, 0]
+    结果           [*−5,  0, −7,  0, *1, 0, 3, 0]
+3.
+    x * cos                 [ 0, 2,  0, 4, 0, 6, 0, 8]
+    rotate_half(x) * sin    [−5, 0, −7, 0, 1, 0, 3, 0]
+                            ─────────────────────────
+    最终结果                 [*−5, 2, −7, 4, *1, 6, 3, 8]  (*是第0对的值)
+
+| 原来的二维对 | 角度 | 旋转后 |
+| `(1,5)` | 90° | `(−5,1)` |
+| `(2,6)` | 0°  | `(2,6)` |
+| `(3,7)` | 90° | `(−7,3)` |
+| `(4,8)` | 0°  | `(4,8)` |
+
+其中：
+    R(a)=   [    
+                [cosa , -sina ]  
+                [sina , cosa  ]
+            ]
+
+    对于第0对q=(1, 5)来说：
+    q'=R(a)q=   [    
+                    [cosa , -sina ]  ·  [0,5]T =   [-5,1]T
+                    [sina , cosa  ]
+                ]
+    因为只有 -sina是需要负数的， -sina只对5相乘，所以只需要对后半部分加符负号
+            
+    """
+# unsqueeze在指定位置插入一个大小为1的维度，用于广播
+    # cos：
+    # 原来    (3,    96)
+    # 之后    (3, 1, 96)    unsqueeze_dim这里是1，所以在cos的1处插入一个大小为1的维度
+# cos需要和q想乘，需要广播，让96维能广播到每一个头上：
+    # Q                 (2, 3, 8, 96)
+    # cos               (1, 3, 1, 96)  第一个1是广播的，第二个1是插入的
     q_embed = ((q * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(q) * sin.unsqueeze(unsqueeze_dim))).to(q.dtype)
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
     return q_embed, k_embed
+
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     bs, slen, num_key_value_heads, head_dim = x.shape
@@ -180,22 +299,30 @@ class MOEFeedForward(nn.Module):
             self.aux_loss = scores.new_zeros(1).squeeze()
         return y.view(batch_size, seq_len, hidden_dim)
 
+# 送进 self.layers里面作为一层
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
         self.self_attn = Attention(config)
+
+        # 归一化，不改变原有的维度数，只是让数值更平稳
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 按配置选择普通 FFN 或 MoE
         self.mlp = FeedForward(config) if not config.use_moe else MOEFeedForward(config)
 
     def forward(self, hidden_states, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        residual = hidden_states
+        residual = hidden_states # 保持原始输入x，用于残差连接
+
+        # x → Norm → Attention → Add(x)
         hidden_states, present_key_value = self.self_attn(
-            self.input_layernorm(hidden_states), position_embeddings,
+            self.input_layernorm(hidden_states), position_embeddings, #先归一化再atten
             past_key_value, use_cache, attention_mask
         )
         hidden_states += residual
+        # Norm → FFN → Add(x)
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+        
         return hidden_states, present_key_value
 
 class MiniMindModel(nn.Module):
@@ -203,6 +330,7 @@ class MiniMindModel(nn.Module):
         super().__init__()
         self.config = config
         self.vocab_size, self.num_hidden_layers = config.vocab_size, config.num_hidden_layers
+        #embed_tokens
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
@@ -216,6 +344,8 @@ class MiniMindModel(nn.Module):
         if hasattr(past_key_values, 'layers'): past_key_values = None
         past_key_values = past_key_values or [None] * len(self.layers)
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+        # embedding嵌入，把ID转化成向量：input_ids由(1,3)--->(1,3,768) 假设batchsize=1条序列，3个token
+        # dropout：在训练时，随机把向量中的部分元素置为 0，剩余元素乘上放大因子，使输出的期望值与输入一致。
         hidden_states = self.dropout(self.embed_tokens(input_ids))
         # Recompute RoPE buffers lost during meta-device init (transformers>=5.x)
         if self.freqs_cos[0, 0] == 0:
@@ -223,6 +353,7 @@ class MiniMindModel(nn.Module):
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
+
         for layer, past_key_value in zip(self.layers, past_key_values):
             hidden_states, present = layer(
                 hidden_states,
@@ -232,6 +363,7 @@ class MiniMindModel(nn.Module):
                 attention_mask=attention_mask
             )
             presents.append(present)
+        # 经过8个layer(block)之后，最后一个block做了Norm → FFN → Add(x)，此时还需要一个归一化调整add之后的
         hidden_states = self.norm(hidden_states)
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
@@ -243,8 +375,11 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
+        #lm_head 由向量-->token
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
-        if self.config.tie_word_embeddings: self.model.embed_tokens.weight = self.lm_head.weight
+        if self.config.tie_word_embeddings: 
+            # embed，lm_head共享权重
+            self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):

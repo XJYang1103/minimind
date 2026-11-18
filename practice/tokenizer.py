@@ -20,7 +20,7 @@ ids = tokenizer.encode(text, add_special_tokens=False)
 
 print("原始文本：", text)
 print("token ID：", ids)
-print("token 数量：", len(ids))
+print("token 数量：", len(ids))  # 把原始的"PyTorch 找不到 GPU"划分成了11个token
 # ID 转成词表里的 token 表示。
 print("词表 token：", tokenizer.convert_ids_to_tokens(ids))
 

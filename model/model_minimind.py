@@ -207,6 +207,8 @@ def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     if n_rep == 1: return x
     return (x[:, :, :, None, :].expand(bs, slen, num_key_value_heads, n_rep, head_dim).reshape(bs, slen, num_key_value_heads * n_rep, head_dim))
 
+
+# MiniMindModel--(layer)-->MiniMindBlock--(config)-->Attention
 class Attention(nn.Module):
     def __init__(self, config: MiniMindConfig):
         super().__init__()
@@ -216,10 +218,13 @@ class Attention(nn.Module):
         self.n_rep = self.n_local_heads // self.n_local_kv_heads
         self.head_dim = config.head_dim
         self.is_causal = True
+
+        #权重矩阵 Wq,Wk,Wv,Wo。开始时随机初始化self.q_proj.weight
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
+
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.attn_dropout = nn.Dropout(config.dropout)
@@ -228,28 +233,80 @@ class Attention(nn.Module):
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and config.flash_attn
 
     def forward(self, x, position_embeddings, past_key_value=None, use_cache=False, attention_mask=None):
-        bsz, seq_len, _ = x.shape
+        bsz, seq_len, _ = x.shape #若x.shape = (2, 3, 768)，则取出这三个值
+        #1. proj映射，用权重矩阵映射 x，变成QKV矩阵
         xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
-        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
-        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
-        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        #2. 划分多头
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)     #..8*96
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)  #..4*96
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)  #..4*96
+
+        #3. 对 Q K做归一化，pre-norm
         xq, xk = self.q_norm(xq), self.k_norm(xk)
+        # 取出从MiniMindModel一路传递过来的 cos，sin 表
         cos, sin = position_embeddings
+        #4. ROPE旋转 Q K
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # KV Cache
         if past_key_value is not None:
             xk = torch.cat([past_key_value[0], xk], dim=1)
             xv = torch.cat([past_key_value[1], xv], dim=1)
         past_kv = (xk, xv) if use_cache else None
-        xq, xk, xv = (xq.transpose(1, 2), repeat_kv(xk, self.n_rep).transpose(1, 2), repeat_kv(xv, self.n_rep).transpose(1, 2))
+
+
+        #5. 先把kv拓展头数(4->8)，跟q的头数匹配。然后再转置1,2维：
+        # 转置前  (2, 3, 8, 96)  batch、token、--头、特征
+        # 转置后  (2, 8, 3, 96)  batch、头、--- token、特征
+        # 让每个头内部单独计算 所有token的q，找所有token的k
+        xq, xk, xv = (  xq.transpose(1, 2), 
+                        repeat_kv(xk, self.n_rep).transpose(1, 2), 
+                        repeat_kv(xv, self.n_rep).transpose(1, 2))
+
+        # 自动完成attention计算
         if self.flash and (seq_len > 1) and (not self.is_causal or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout_p=self.dropout if self.training else 0.0, is_causal=self.is_causal)
-        else:
+
+        else: #6. 注意力分数 Q=(2, 8, 3, 96)，Kᵀ=(2, 8, 96, 3) ，所以scores的行是q，列是k
             scores = (xq @ xk.transpose(-2, -1)).float() / math.sqrt(self.head_dim)
-            if self.is_causal: scores[:, :, :, -seq_len:] += torch.full((seq_len, seq_len), float("-inf"), device=scores.device).triu(1)
-            if attention_mask is not None: scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
-            output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq)) @ xv
+            # 7.因果遮罩，屏蔽未来位置
+            if self.is_causal: 
+                scores[:, :, :, -seq_len:] += (
+                torch.full(                  # torch.full 创建并填满矩阵
+                    (seq_len, seq_len),      #矩阵形状 3*3
+                    float("-inf"),           # 用什么填充
+                    device=scores.device
+                    )
+                    .triu(1)  
+                # triu 表示取上三角，参数 1 表示从主对角线上方第一条对角线开始保留。其他位置变成 0。 
+                # [0, −∞, −∞]
+                # [0,  0, −∞]
+                # [0,  0,  0]
+                )
+            # Padding 遮罩，屏蔽无效输入
+            if attention_mask is not None: 
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * -1e9
+            #1.softmax变成概率分布，scores.shape(2, 8, 3, 3)，8个qkv头(已拓展)，3是token数
+            """
+            dim=-1是对列（key）操作，每一行的三个数和为1
+            scores的最后两维：
+                                Key 0   Key 1   Key 2
+                        q0       1      −∞      −∞
+                        q1       1       2      −∞
+                        q2       1       2       3
+            softmax:
+                    [1.0000, 0.0000, 0.0000],   和为1
+                    [0.2689, 0.7311, 0.0000],   和为1
+                    [0.0900, 0.2447, 0.6652]    和为1
+            """
+            #2.dropout，在训练时随机丢弃部分权重
+            #3.计算attention：(..3*3)跟v(3*96)加权求和,得到 output.shape = (2, 8, 3, 96)
+            output = self.attn_dropout(F.softmax(scores, dim=-1).type_as(xq))  @ xv
+        #把头和token的维度换回来， (2, 8, 3, 96) → (2, 3, 8, 96)
+        # -1：拼接8个头分别计算出来的注意力向量    (2, 3, 8, 96) → (2, 3, 768)
         output = output.transpose(1, 2).reshape(bsz, seq_len, -1)
-        output = self.resid_dropout(self.o_proj(output))
+        # 拼接之后的注意力，再经过一下映射(768*768)融合起来，然后经过一次dropout
+        output = self.resid_dropout(self.o_proj(output)) #这里还没有执行残差相加。相加发生在外面的 MiniMindBlock 中。
         return output, past_kv
 
 class FeedForward(nn.Module):
@@ -303,7 +360,7 @@ class MOEFeedForward(nn.Module):
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
         super().__init__()
-        self.self_attn = Attention(config)
+        self.self_attn = Attention(config) # 把block从model.layer接收的值传到atten
 
         # 归一化，不改变原有的维度数，只是让数值更平稳
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -335,6 +392,7 @@ class MiniMindModel(nn.Module):
         self.dropout = nn.Dropout(config.dropout)
         self.layers = nn.ModuleList([MiniMindBlock(l, config) for l in range(self.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # 初始化模型时，提前生成完整cos，sin表
         freqs_cos, freqs_sin = precompute_freqs_cis(dim=config.head_dim, end=config.max_position_embeddings, rope_base=config.rope_theta, rope_scaling=config.rope_scaling)
         self.register_buffer("freqs_cos", freqs_cos, persistent=False)
         self.register_buffer("freqs_sin", freqs_sin, persistent=False)
@@ -351,6 +409,7 @@ class MiniMindModel(nn.Module):
         if self.freqs_cos[0, 0] == 0:
             freqs_cos, freqs_sin = precompute_freqs_cis(dim=self.config.head_dim, end=self.config.max_position_embeddings, rope_base=self.config.rope_theta, rope_scaling=self.config.rope_scaling)
             self.freqs_cos, self.freqs_sin = freqs_cos.to(hidden_states.device), freqs_sin.to(hidden_states.device)
+        #前向计算时，截取当前的位置，送入block，block再送入atten
         position_embeddings = (self.freqs_cos[start_pos:start_pos + seq_length], self.freqs_sin[start_pos:start_pos + seq_length])
         presents = []
 

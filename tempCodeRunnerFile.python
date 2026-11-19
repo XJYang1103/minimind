@@ -1,0 +1,22 @@
+import torch
+
+scores = torch.tensor([[
+    [1., 2., 3., 4., 5.],
+    [2., 3., 4., 5., 6.],
+]]).unsqueeze(0)  # (1, 1, 2, 5)
+
+seq_len = 2
+
+print("原始分数：\n", scores)
+print("最后两列：\n", scores[:, :, :, -seq_len:])
+
+mask = torch.full(
+    (seq_len, seq_len),
+    float("-inf"),
+    device=scores.device,
+).triu(1)
+
+scores[:, :, :, -seq_len:] += mask
+
+print("遮罩后的完整分数：\n", scores)
+print("注意力权重：\n", torch.softmax(scores, dim=-1))

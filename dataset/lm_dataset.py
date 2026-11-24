@@ -57,7 +57,7 @@ class PretrainDataset(Dataset):
         labels[input_ids == self.tokenizer.pad_token_id] = -100
         return input_ids, labels
 
-
+# 重点
 class SFTDataset(Dataset):
     def __init__(self, jsonl_path, tokenizer, max_length=1024):
         super().__init__()
@@ -75,51 +75,94 @@ class SFTDataset(Dataset):
         messages = []
         tools = None
         for message in conversations:
+            # 取出json，转化成字典
             message = dict(message)
+            # role如果是json字符串，就用loads转化成list：tools = [{"name": "get_weather"}]
             if message.get("role") == "system" and message.get("tools"):
-                tools = json.loads(message["tools"]) if isinstance(message["tools"], str) else message["tools"]
+                tools = json.loads(message["tools"]) if isinstance(message
+                                            ["tools"], str) else message["tools"]
             if message.get("tool_calls") and isinstance(message["tool_calls"], str):
                 message["tool_calls"] = json.loads(message["tool_calls"])
             messages.append(message)
+
+        # 把messages列表，变成一段 Chat_Template
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=False,
             tools=tools
         )
-
+    # 构造训练标签 labels：只保留 assistant 回答及结束标记对应的 token ID，其余位置填 -100，不参与 Loss。
     def generate_labels(self, input_ids):
-        labels = [-100] * len(input_ids)
+        labels = [-100] * len(input_ids) # 初始化全不保留
         i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
+        while i < len(input_ids): # 寻找assistant 开头
+            """
+            因为标记可能占多个token，所以用input_ids[i:i + len(self.bos_id)]切块来匹配
+            self.bos_id = [10, 20, 30]  # assistant 开头标记
+
+            input_ids 数字表示 Tokenizer 分词并编码后得到的 token ID
+
+            input_ids = [10, 20, 30, 45, 46, 47, 90, 91]
+            # 索引：      0   1   2   3   4   5   6   7
+            # 内容：     └─助手开头─┘ └─回答正文─┘ └结束┘
+            """
+            #比较两个列表，找起始标记
+            if input_ids[i:i + len(self.bos_id)] == self.bos_id:  
+                start = i + len(self.bos_id) #找到了回答的开头
                 end = start
-                while end < len(input_ids):
+                while end < len(input_ids): #用来找结束位置end
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
+                # 只把回答部分的labels[j]设置成input_ids
                 for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     labels[j] = input_ids[j]
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
+            #没找到其实标记就继续向后寻找
             else:
                 i += 1
         return labels
 
+    """
+    dataset[index]
+        ↓ 自动调用 __getitem__(index)
+    读取一条 conversations
+        ↓
+    应用 Chat Template，得到字符串
+        ↓
+    Tokenizer，得到 ID 列表
+        ↓
+    截断到 max_length，不足则补 PAD
+        ↓
+    生成 labels，只监督回答部分
+        ↓
+    返回两个 torch.long 张量
+    """
     def __getitem__(self, index):
+        # ① 读取第 index 条样本
         sample = self.samples[index]
+        # ② 对消息列表做预处理
         conversations = pre_processing_chat(sample['conversations'])
+        # ③ 应用 Chat Template：消息列表 → 对话字符串
         prompt = self.create_chat_prompt(conversations)
+        # ④ 对生成的字符串做后处理
         prompt = post_processing_chat(prompt)
+
+        # ⑤ Tokenizer：字符串 → ID 列表，再截断
         input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        # ⑥ 长度不足 max_length，就在右边补 PAD ：pad_token_id
+        input_ids += [self.tokenizer.pad_token_id] * (
+            self.max_length - len(input_ids)
+        )
+        
+        # ⑦ 生成标签：保留回答及结束标记，其余设为 -100
         labels = self.generate_labels(input_ids)
-        # # === 调试打印 ===
-        # print(f"\n--- Sample {index} ---")
-        # for i, (x, y) in enumerate(zip(input_ids[:-1], labels[1:])):
-        #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
-        # # ================
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
+        # ⑧ 两个 Python 列表 → 两个整数张量
+        return (
+            torch.tensor(input_ids, dtype=torch.long), # 分词后的序号
+            torch.tensor(labels, dtype=torch.long)  # 只保留回答的序号
+        )
 
 
 class DPODataset(Dataset):

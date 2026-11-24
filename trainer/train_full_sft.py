@@ -30,21 +30,27 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
+        #1.使用自动精度
         with autocast_ctx:
+            #2.前向传播,计算loss
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            # 梯度累计 的时候，每次算loss都要除以accumulation_steps
+            # args.accumulation_steps：一次累计多少个batch
+            loss = loss / args.accumulation_steps 
 
-        scaler.scale(loss).backward()
+        #3.计算梯度，先放大loss(FP16才需要扩大，BF16可以不用scale)
+        scaler.scale(loss).backward() 
 
+        # 累计梯度，step == iters：到这一轮最后一个 batch，即使没累积够，也处理剩余梯度
         if step % args.accumulation_steps == 0 or step == iters:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            scaler.unscale_(optimizer) #先缩小loss
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip) #再梯度裁剪
 
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.step(optimizer) #4.更新参数
+            scaler.update() #更新loss的缩放系数
 
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad(set_to_none=True) #5.清空梯度
 
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
@@ -65,7 +71,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, 
-                         epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
+                        epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints', scaler=scaler)
             model.train()
             del state_dict
 
@@ -107,6 +113,7 @@ if __name__ == "__main__":
     # ========== 2. 配置目录、模型参数、检查ckp ==========
     os.makedirs(args.save_dir, exist_ok=True)
     lm_config = MiniMindConfig(hidden_size=args.hidden_size, num_hidden_layers=args.num_hidden_layers, use_moe=bool(args.use_moe))
+    # 尝试读取续训检查点
     ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume==1 else None
     
     # ========== 3. 设置混合精度 ==========
@@ -114,7 +121,7 @@ if __name__ == "__main__":
     dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
     
-    # ========== 4. 配wandb ==========
+    # ========== 4. 配 wandb ==========
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
@@ -123,8 +130,10 @@ if __name__ == "__main__":
         wandb_run_name = f"MiniMind-Full-SFT-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
-    # ========== 5. 定义模型、数据、优化器 ==========
+# ========== 5. 定义模型、数据、优化器 ==========
+    # 创建模型，加载权重
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    # 创建训练小数据集: 对话数据 → input_ids、labels
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))

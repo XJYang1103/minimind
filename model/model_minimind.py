@@ -427,6 +427,7 @@ class MiniMindModel(nn.Module):
         aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MOEFeedForward)], hidden_states.new_zeros(1).squeeze())
         return hidden_states, presents, aux_loss
 
+# 用来真正实现训练的类，包括预训练和SFT，完成预测下一个词的任务
 class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
     config_class = MiniMindConfig
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
@@ -434,25 +435,38 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self.config = config or MiniMindConfig()
         super().__init__(self.config)
         self.model = MiniMindModel(self.config)
-        #lm_head 由向量-->token
+        #lm_head 将每个位置的隐藏向量转换为词表分数（最后一层的线性层，将向量变回词）
+        ## lm_head：隐藏向量 → 词表分数 logits，不是直接得到 token
         self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias=False)
+        
         if self.config.tie_word_embeddings: 
             # embed，lm_head共享权重
             self.model.embed_tokens.weight = self.lm_head.weight
         self.post_init()
 
     def forward(self, input_ids, attention_mask=None, past_key_values=None, use_cache=False, logits_to_keep=0, labels=None, **kwargs):
+        # 经过model，得到最终的隐藏状态
         hidden_states, past_key_values, aux_loss = self.model(input_ids, attention_mask, past_key_values, use_cache, **kwargs)
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+
+        # 最后一个线性层，接收atten分数，得到词表得分：(2, 6, 768) → (2, 6, 6400) 词表大小6400
         logits = self.lm_head(hidden_states[:, slice_indices, :])
         loss = None
+
         if labels is not None:
-            x, y = logits[..., :-1, :].contiguous(), labels[..., 1:].contiguous()
-            loss = F.cross_entropy(x.view(-1, x.size(-1)), y.view(-1), ignore_index=-100)
+            # x是全部的分数，但是labels要向后错开一个token，保证labels是要预测的值
+            x = logits[..., :-1, :].contiguous() # (2, 5, 6400)  batch、预测位置、词表分数
+            y = labels[..., 1:].contiguous()   # (2, 5)   每个位置的目标 ID
+            loss = F.cross_entropy(
+                # 展平xy，view和reshape都需要一个新的对象接收返回值，不改变原来xy的形状
+                x.view(-1, x.size(-1)),  #(2, 5, 6400) → (10, 6400)，x.size(-1)是最后一维的大小
+                y.view(-1),              #(2, 5)       → (10,)
+                ignore_index=-100)
         return MoeCausalLMOutputWithPast(loss=loss, aux_loss=aux_loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
     
     # https://github.com/jingyaogong/minimind/discussions/611
     @torch.inference_mode()
+    # 执行多次 forward，不断的预测下一个词
     def generate(self, inputs=None, attention_mask=None, max_new_tokens=8192, temperature=0.85, top_p=0.85, top_k=50, eos_token_id=2, streamer=None, use_cache=True, num_return_sequences=1, do_sample=True, repetition_penalty=1.0, **kwargs):
         input_ids = kwargs.pop("input_ids", inputs).repeat(num_return_sequences, 1)
         attention_mask = attention_mask.repeat(num_return_sequences, 1) if attention_mask is not None else None

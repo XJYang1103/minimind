@@ -14,10 +14,15 @@ class LoRA(nn.Module):
         # 矩阵B全0初始化
         self.B.weight.data.zero_()
 
+    # 训练的是 A、B 的参数。
     def forward(self, x):
-        return self.B(self.A(x))
+        # 假设原来输入和输出向量的特征维度in_features=out_features=8，r=2
+        # x先经过A： 8-->2
+        # 再经过B： 2-->8
+        return self.B(self.A(x))  
 
-
+#创建lora分支，但是还需要load来加载AB矩阵
+# 把A B 在forward时把得到的结果相加，但是矩阵 W 没变
 def apply_lora(model, rank=16):
     for name, module in model.named_modules():
         if isinstance(module, nn.Linear) and module.in_features == module.out_features:
@@ -27,11 +32,11 @@ def apply_lora(model, rank=16):
 
             # 显式绑定
             def forward_with_lora(x, layer1=original_forward, layer2=lora):
-                return layer1(x) + layer2(x)
+                return layer1(x) + layer2(x) # 把原来的线性层 + AB线性层
 
             module.forward = forward_with_lora
 
-
+#加载AB矩阵
 def load_lora(model, path):
     state_dict = torch.load(path, map_location=model.device)
     state_dict = {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
@@ -41,7 +46,7 @@ def load_lora(model, path):
             lora_state = {k.replace(f'{name}.lora.', ''): v for k, v in state_dict.items() if f'{name}.lora.' in k}
             module.lora.load_state_dict(lora_state)
 
-
+# 只保存 A、B
 def save_lora(model, path):
     raw_model = getattr(model, '_orig_mod', model)
     state_dict = {}
@@ -53,6 +58,8 @@ def save_lora(model, path):
     torch.save(state_dict, path)
 
 
+# 把 W加上A B，修改权重矩阵，然后save
+# 保存好加上AB的权重之后。下次就不需要重新调用apply_lora
 def merge_lora(model, lora_path, save_path):
     load_lora(model, lora_path)
     raw_model = getattr(model, '_orig_mod', model)

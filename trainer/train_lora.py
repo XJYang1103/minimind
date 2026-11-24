@@ -117,7 +117,7 @@ if __name__ == "__main__":
         wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
-    # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
+# ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
     model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
     apply_lora(model, rank=args.lora_rank)
     
@@ -130,14 +130,21 @@ if __name__ == "__main__":
     
     # 冻结非LoRA参数，收集LoRA参数
     lora_params = []
-    for name, param in model.named_parameters():
+    for name, param in model.named_parameters():  # name是参数的名字
         if 'lora' in name:
-            param.requires_grad = True
-            lora_params.append(param)
+            param.requires_grad = True  # 参数名字带lora的(A,B)，更新梯度
+            lora_params.append(param) # 把参数放进待优化列表，没有复制一份参数。
         else:
-            param.requires_grad = False
+            param.requires_grad = False # 参数名字不带lora的(W)，冻结梯度
     
     # ========== 6. 定义数据和优化器 ==========
+    """
+    数据仍使用 SFTDataset”:
+        这里是在用 LoRA 的方式做 SFT。
+
+    SFT: 只让计算回答部分的loss
+    Lora: 只更新AB的参数，不更新W的参数，但是W依旧参与forward
+    """
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
